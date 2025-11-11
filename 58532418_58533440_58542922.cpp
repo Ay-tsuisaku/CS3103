@@ -3,15 +3,20 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <semaphore.h>
-#include "generate_frame_vector.c"
-#include "compression.c"
 #include <cstring>
+#include <cmath>
 
 using namespace std;
 
-// given in document: FIFO buffer size = 5, generate_frame_vector(l), where l = 8
 #define CACHE_SIZE 5
 #define FRAME_LEN 8
+#define MAX_FRAMES 10
+
+// External function declarations
+extern "C" {
+    double* generate_frame_vector(int length);
+    double* compression(double* frame, int length);
+}
 
 struct QueueEntry {
     double* original_frame;
@@ -35,7 +40,6 @@ struct Queue {
     }
     double* dequeue() {
         if (empty()) return NULL;
-        // id = front;
         double* output = queue[front].original_frame;
         front = (front + 1) % CACHE_SIZE;
         count--;
@@ -46,17 +50,20 @@ struct Queue {
         return queue[front].original_frame;
     }
     double* set_compressed(double* compressed) {
-        if (!empty()) queue[front].compressed_frame = compressed;
+        if (!empty()) {
+            queue[front].compressed_frame = compressed;
+        }
+        return compressed;
     }
 };
 
 Queue frame_cache;
 
 sem_t cache_emptied;
-sem_t cache_loaded; // ready for transformer
-sem_t transformer_loaded; // ready for MSE
-sem_t mse_loaded; // ready for camera
-double temp[FRAME_LEN]; // "temporary frame recorder"
+sem_t cache_loaded;
+sem_t transformer_loaded;
+sem_t mse_loaded;
+double temp[FRAME_LEN];
 
 pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -68,76 +75,86 @@ double calculate_mse(const double* a, const double* b, int len) {
     return mse;
 }
 
-
 void* camera(void* arg) {
     int INTERVAL_SECONDS = (int)(intptr_t)arg;
-    int done = 0;
-    while(!done) {
+    int frames_generated = 0;
+    
+    while(frames_generated < MAX_FRAMES) {
         double* frame = generate_frame_vector(FRAME_LEN);
         if (!frame) break;
-        // ^^ "After a certain number of frames are generated, the function generate_frame_vector() returns NULL and the camera exits."
-        if (frame_cache.full()) sem_wait(&cache_emptied);
-        // ^^ "When the cache is full, the camera has to wait for the signal from the estimator after it deletes a frame from the cache."
+        
+        sem_wait(&cache_emptied);
+        
         pthread_mutex_lock(&mutex);
         frame_cache.enqueue(frame);
-        sleep(INTERVAL_SECONDS);
-        // ^^ "Takes the camera interval seconds to load a frame into the cache."
         pthread_mutex_unlock(&mutex);
 
         sem_post(&cache_loaded);
+        
+        sleep(INTERVAL_SECONDS);
+        frames_generated++;
     }
     return NULL;
 }
 
 void* transformer(void* arg) {
-    while (true) {
+    int frames_compressed = 0;
+    
+    while(frames_compressed < MAX_FRAMES) {
         sem_wait(&cache_loaded);
+        
         pthread_mutex_lock(&mutex);
         if (frame_cache.empty()) {
             pthread_mutex_unlock(&mutex);
             break;
         }
+        
         double* original = frame_cache.get_noDequeue();
         memcpy(temp, original, FRAME_LEN * sizeof(double));
-        // ^^ "In the temporary frame recorder"
-        frame_cache.set_compressed(compression(temp, FRAME_LEN));
-        sleep(3);
-        // ^^ "It takes the transformer 3 seconds to compress the extracted frame..."
+        compression(temp, FRAME_LEN);
+        
         pthread_mutex_unlock(&mutex);
+        
+        sleep(3);
         sem_post(&transformer_loaded);
-        // ^^ "Signals the estimator to computer the MSE."
+        frames_compressed++;
     }
     return NULL;
 }
 
 void* estimator(void* arg) {
-    while (true) {
+    int frames_estimated = 0;
+    
+    while(frames_estimated < MAX_FRAMES) {
         sem_wait(&transformer_loaded);
+        
         pthread_mutex_lock(&mutex);
         if (frame_cache.empty()) {
             pthread_mutex_unlock(&mutex);
             break;
         }
+        
         double* original = frame_cache.get_noDequeue();
-        double* compressed = temp;
-        // ^^ "...between the compressed frame in the temporary frame recorder and the corresponding original frame in the cache."
-        double mse = calculate_mse(original, compressed, FRAME_LEN);
-        printf("MSE: %f\n", mse);
+        double mse = calculate_mse(original, temp, FRAME_LEN);
+        printf("mse = %f\n", mse);
 
-        frame_cache.dequeue();
+        double* frame_to_free = frame_cache.dequeue();
+        free(frame_to_free);
+        
         pthread_mutex_unlock(&mutex);
+        
         sem_post(&cache_emptied);
+        frames_estimated++;
     }
     return NULL;
 }
 
 int main(int argc, char *argv[]) {
-
     if (argc != 2) {
         printf("Invalid number of arguments.");
         return 0;
     }
-    int INTERVAL_SECONDS = *argv[1] - '0';
+    int INTERVAL_SECONDS = atoi(argv[1]);
 
     sem_init(&cache_loaded, 0, 0);
     sem_init(&cache_emptied, 0, CACHE_SIZE);
@@ -163,8 +180,5 @@ int main(int argc, char *argv[]) {
 
     return 0;
 }
-
-
-
 
 
