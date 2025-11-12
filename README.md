@@ -43,6 +43,9 @@ $ ./58532418_58533440_58542922 2
 -Then you can see the expected output:
 
 mse = 0.000541
+
 mse = 0.000578
+
 ...
+
 (10 lines for 10 frames)
